@@ -1,6 +1,14 @@
 ﻿# JTY-BidRadar Windows 任务计划程序安装脚本
 # 用法（普通 PowerShell，无需管理员）：powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1
+# 多 Python 环境（多版本/Store alias/虚拟环境）可显式指定解释器：
+#   powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 -PythonExe "C:\Path\To\python.exe"
+# 试运行（只完成全部检查、不注册任务）：加 -DryRun
 # 幂等：任务已存在则先删除同名任务再重建（更新），不会创建多个同名任务。
+
+param(
+    [string]$PythonExe = "",   # 可选：显式指定 python.exe（pythonw.exe 取同目录推导）
+    [switch]$DryRun            # 可选：只解析并完成全部检查，不实际注册任务
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -14,11 +22,19 @@ Write-Host "== JTY-BidRadar 计划任务安装 =="
 if (-not (Test-Path $monitor)) { throw "monitor.py 不存在: $monitor" }
 Write-Host "[ok] monitor.py : $monitor"
 
-# 2. 检查 Python（取绝对路径，不依赖 PATH 解析顺序之外的东西）
+# 2. 检查 Python（显式指定优先；否则取 PATH 中的 python.exe 绝对路径）
 #    计划任务用 pythonw.exe（无控制台窗口静默运行）；依赖检查仍用 python.exe（有标准输出）。
-$py = (Get-Command python -ErrorAction Stop).Source
+if ($PythonExe) {
+    if (-not (Test-Path $PythonExe)) { throw "指定的 -PythonExe 不存在: $PythonExe" }
+    $py = (Resolve-Path $PythonExe).Path
+    & $py -c "import sys"
+    if ($LASTEXITCODE -ne 0) { throw "指定的 -PythonExe 无法执行: $py" }
+    Write-Host "[ok] 使用显式指定的 python.exe : $py"
+} else {
+    $py = (Get-Command python -ErrorAction Stop).Source
+}
 $pyw = Join-Path (Split-Path $py -Parent) "pythonw.exe"
-if (-not (Test-Path $pyw)) { throw "pythonw.exe 不存在: $pyw" }
+if (-not (Test-Path $pyw)) { throw "pythonw.exe 不存在: $pyw（请检查 -PythonExe 是否指向真实的 python.exe 安装目录）" }
 Write-Host "[ok] python.exe : $py"
 Write-Host "[ok] pythonw.exe: $pyw"
 
@@ -44,6 +60,16 @@ $settings = New-ScheduledTaskSettingsSet `
 # 仅当前用户登录状态下运行（含锁屏）；不保存 Windows 密码，不做提权
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME `
     -LogonType Interactive -RunLevel Limited
+
+# 试运行：全部检查已完成，输出将要注册的内容并退出（不改动现有任务）
+if ($DryRun) {
+    Write-Host "[dry-run] 检查全部通过，未注册任务。将注册内容："
+    Write-Host ("  任务名     : {0}" -f $taskName)
+    Write-Host ("  Execute    : {0}" -f $pyw)
+    Write-Host ('  Arguments  : "{0}"' -f $monitor)
+    Write-Host ("  WorkingDir : {0}" -f $root)
+    return
+}
 
 # 5. 幂等安装（先删同名任务）
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue

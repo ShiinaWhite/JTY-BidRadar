@@ -72,7 +72,10 @@ python setup_email.py
 python monitor.py --test-email
 ```
 
-其他 SMTP 服务商：修改 `setup_email.py` 中的 `smtp_host` / `smtp_port` 即可。
+其他 SMTP 服务商：当前邮件模块使用 SMTP over SSL（`smtplib.SMTP_SSL`）。
+QQ 邮箱 `smtp.qq.com:465` 已验证；其他同样支持 SMTP over SSL 的服务商通常
+只需调整 `setup_email.py` 中的 `smtp_host` / `smtp_port`。如果服务商要求
+STARTTLS（常见端口 587）或其他认证方式，则需要相应修改 `email_notifier.py`。
 
 ## 安装计划任务
 
@@ -82,6 +85,16 @@ python monitor.py --test-email
 powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1          # Source 1，每 30 分钟
 powershell -ExecutionPolicy Bypass -File scripts\install_sgcc_task.ps1     # Source 2，每天 09:30/15:30
 ```
+
+如果机器上安装了多个 Python（多版本 / Microsoft Store alias / 虚拟环境），
+可显式指定解释器（`pythonw.exe` 自动取同目录推导）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1 `
+  -PythonExe "C:\Path\To\python.exe"
+```
+
+只完成检查、不实际注册任务，可加 `-DryRun` 试运行。
 
 脚本用自身位置推导项目根（`$PSScriptRoot`），自动检查 Python 与依赖，
 注册任务 `JTY-BidRadar` / `JTY-BidRadar-SGCC`：
@@ -160,6 +173,19 @@ python -I tests/run_tests_sgcc.py     # Source 2：API 校验/软拦截/递归�
 - 工具仅只读访问目标站点公开页面/公开接口，串行低频请求，不登录、不绕过
   任何访问控制；使用时请遵守目标站点的服务条款与 robots 协议。
 
-## 许可证
+## License / Usage
 
-尚未选择开源许可证（LICENSE = NOT_SET）。在许可证确定之前，默认保留所有权利。
+This repository is publicly accessible for source review and technical
+evaluation only.
+
+No open-source license is granted.
+Unless separately authorized by the copyright holder, copying, modification,
+redistribution, sublicensing, or commercial use is not permitted.
+
+All rights reserved.
+
+本仓库公开仅用于源码审阅、技术交流与评估，不代表以开源许可证授权。
+
+除非获得著作权人另行明确授权，不授予复制、修改、再发布、再许可或商业使用权。
+
+保留所有权利。
