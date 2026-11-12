@@ -1,0 +1,26 @@
+# Python 运行时产物
+__pycache__/
+*.pyc
+
+# 运行时数据与日志（绝不提交）
+data/
+logs/
+*.log
+
+# 本机私密配置（绝不提交）
+email_secrets.json
+*.db
+*.sqlite
+*.sqlite3
+
+# 环境变量文件
+.env
+.env.*
+
+# 调查材料与真实样本（绝不提交）
+investigation/
+*.zip
+*.rar
+
+# 本地私有测试样本（用户自备真实样本，绝不提交）
+tests/fixtures_local/
