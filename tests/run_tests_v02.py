@@ -208,8 +208,8 @@ def main():
     assert notified and notified.endswith("+08:00"), f"notified_at 异常: {notified}"
     print(f"  ok  notified_at 已写入: {notified}")
     assert_eq(len(_smtp.calls), 1, "邮件数（合并为一封）")
-    expect_prefix = "[JTY-BidRadar] 新工程招标公告："
-    assert _smtp.calls[0].startswith(expect_prefix), f"主题前缀不符: {_smtp.calls[0]}"
+    # V0.4：单条主题带相关性等级（合成 fixture 含电力资质 → A）
+    assert _smtp.calls[0].startswith("[JTY-BidRadar][")         and "新工程招标：" in _smtp.calls[0], f"主题前缀不符: {_smtp.calls[0]}"
     print(f"  ok  单条主题格式: {_smtp.calls[0]}")
 
     # ---------- T8 多条新增合并一封 ----------

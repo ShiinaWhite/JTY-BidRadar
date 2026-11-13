@@ -150,7 +150,9 @@ def main():
     conn.close()
     assert_eq(base_n, 49, "baseline 数（10 种子 + 39 历史补帐）")
     assert_eq(len(_smtp.calls), 1, "邮件数（1 封）")
-    assert _smtp.calls[0].startswith("[JTY-BidRadar] 新工程招标公告："), _smtp.calls[0]
+    # V0.4：单条主题带相关性等级（等级取决于 fixture 内容：private 真实页=B、public 合成页=A）
+    assert _smtp.calls[0].startswith("[JTY-BidRadar][") \
+        and "新工程招标：" in _smtp.calls[0], _smtp.calls[0]
     assert "40" not in _smtp.calls[0], "不得再出现 40 条邮件"
     assert any("historical unseen item backfilled as baseline" in m
                for m in new_messages()), "缺少补帐日志"

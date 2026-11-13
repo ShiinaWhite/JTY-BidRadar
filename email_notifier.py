@@ -93,18 +93,84 @@ def _cut_field(v) -> str:
     return v[:MAX_FIELD_CHARS] + TRUNCATE_SUFFIX.format(n=MAX_FIELD_CHARS)
 
 
+# ---- V0.4 相关性展示（只影响带 relevance_level 的公告；旧数据/Source2 不受影响） ----
+LEVEL_LABELS = {"A": "高相关", "B": "可能相关"}
+
+
+def _has_relevance(items: list[dict]) -> bool:
+    return any((it.get("relevance_level") or "") in LEVEL_LABELS for it in items)
+
+
+def _short_reasons(filter_reasons: str, limit: int = 5) -> str:
+    """从 DB filter_reasons（标题命中:a,b; 正文命中:c; 资质命中:d）提取
+    手机上可读的前 limit 个主要理由词，用「、」连接。"""
+    if not filter_reasons:
+        return ""
+    words: list[str] = []
+    for part in filter_reasons.split(";"):
+        head, _, tail = part.strip().partition(":")
+        if head in ("标题命中", "正文命中", "资质命中"):
+            words.extend(w for w in tail.split(",") if w and w != "…")
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+        if len(out) >= limit:
+            break
+    return "、".join(out)
+
+
+def _build_subject(items: list[dict]) -> str:
+    """邮件主题。
+
+    带相关性评级（Source 1 V0.4）：
+      单条 A：[JTY-BidRadar][A-高相关] 新工程招标：项目名称
+      单条 B：[JTY-BidRadar][B-可能相关] 新工程招标：项目名称
+      多条混合：[JTY-BidRadar] 发现 3 条相关工程招标公告（A:1 / B:2）
+      全 A：    [JTY-BidRadar] 发现 2 条高相关工程招标公告
+      全 B：    [JTY-BidRadar] 发现 2 条可能相关工程招标公告
+    无评级（历史数据/兼容）：沿用 V0.2 旧格式。同一轮次始终只发一封。
+    """
+    n = len(items)
+    title = (items[0].get("title") or "").strip()
+    if not _has_relevance(items):
+        if n == 1:
+            return f"[JTY-BidRadar] 新工程招标公告：{title[:30]}"
+        return f"[JTY-BidRadar] 发现 {n} 条新的工程招标公告"
+    if n == 1:
+        lvl = items[0].get("relevance_level") or "B"
+        return f"[JTY-BidRadar][{lvl}-{LEVEL_LABELS[lvl]}] 新工程招标：{title[:30]}"
+    a = sum(1 for it in items if it.get("relevance_level") == "A")
+    b = sum(1 for it in items if it.get("relevance_level") == "B")
+    if a and b:
+        return f"[JTY-BidRadar] 发现 {n} 条相关工程招标公告（A:{a} / B:{b}）"
+    if a:
+        return f"[JTY-BidRadar] 发现 {n} 条高相关工程招标公告"
+    return f"[JTY-BidRadar] 发现 {n} 条可能相关工程招标公告"
+
+
 def build_digest(items: list[dict], checked_at: str) -> tuple[str, str, str]:
     """把待通知公告构建为一封汇总邮件，返回 (subject, html, text)。"""
     n = len(items)
-    if n == 1:
-        title = (items[0].get("title") or "").strip()
-        subject = f"[JTY-BidRadar] 新工程招标公告：{title[:30]}"
+    rel = _has_relevance(items)
+    subject = _build_subject(items)
+
+    a = sum(1 for it in items if it.get("relevance_level") == "A") if rel else 0
+    b = sum(1 for it in items if it.get("relevance_level") == "B") if rel else 0
+    if rel:
+        count_note = (f"（高相关 {a} 条 / 可能相关 {b} 条）" if a and b
+                      else f"（{LEVEL_LABELS.get('A') if a else LEVEL_LABELS.get('B')}）")
+        head_line = f"本轮发现 <b>{n}</b> 条相关工程招标公告{count_note}。"
+        head_line_t = f"本轮发现 {n} 条相关工程招标公告{count_note}。"
     else:
-        subject = f"[JTY-BidRadar] 发现 {n} 条新的工程招标公告"
+        head_line = f"本轮发现 <b>{n}</b> 条新的工程招标公告。"
+        head_line_t = f"本轮发现 {n} 条新的工程招标公告。"
 
     head_html = (
         '<h2 style="margin:0 0 8px;color:#1e52a8;">JTY-BidRadar</h2>'
-        f'<p style="margin:4px 0;">本轮发现 <b>{n}</b> 条新的工程招标公告。</p>'
+        f'<p style="margin:4px 0;">{head_line}</p>'
         '<p style="margin:4px 0;color:#666;font-size:13px;">'
         f'检查时间：{escape(checked_at)}<br>'
         '来源：中煤招标与采购网 → 招标公告 → 工程</p>'
@@ -112,7 +178,7 @@ def build_digest(items: list[dict], checked_at: str) -> tuple[str, str, str]:
 
     head_text = (
         "JTY-BidRadar\n\n"
-        f"本轮发现 {n} 条新的工程招标公告。\n"
+        f"{head_line_t}\n"
         f"检查时间：{checked_at}\n"
         "来源：中煤招标与采购网 → 招标公告 → 工程\n")
 
@@ -122,6 +188,21 @@ def build_digest(items: list[dict], checked_at: str) -> tuple[str, str, str]:
         title = escape(it.get("title") or "未提取")
         link_html = (f'<a href="{escape(url)}" style="color:#1e52a8;">{title}</a>'
                      if url else title)
+        # 相关性头部：等级 + 最主要的 3~5 个筛选依据（不展示内部打分细节）
+        lvl = (it.get("relevance_level") or "").strip()
+        rel_html = ""
+        rel_text = ""
+        if lvl in LEVEL_LABELS:
+            reasons = _short_reasons(it.get("filter_reasons") or "")
+            color = "#1e52a8" if lvl == "A" else "#b8860b"
+            rel_html = (f'<div style="margin:2px 0 6px;">'
+                        f'<div style="font-weight:bold;color:{color};">'
+                        f'相关性：{lvl} · {LEVEL_LABELS[lvl]}</div>'
+                        + (f'<div style="color:#666;font-size:13px;">'
+                           f'筛选依据：{escape(reasons)}</div>' if reasons else "")
+                        + "</div>")
+            rel_text = (f"  相关性：{lvl} · {LEVEL_LABELS[lvl]}\n"
+                        + (f"  筛选依据：{reasons}\n" if reasons else ""))
         rows = [
             ("发布日期", it.get("publish_date")),
             ("项目编号", it.get("project_no")),
@@ -169,18 +250,20 @@ def build_digest(items: list[dict], checked_at: str) -> tuple[str, str, str]:
         html_parts.append(
             f'<div style="margin:0 0 18px;">'
             f'<h3 style="margin:10px 0 6px;font-size:15px;">【{i}】{link_html}</h3>'
+            f'{rel_html}'
             f'<table style="font-size:14px;line-height:1.7;border-collapse:collapse;">'
             f'{cells}</table>{long_html}{link_bottom}</div>')
         text_parts.append(
             f"{'─' * 40}\n【{i}】{it.get('title') or '未提取'}\n"
+            + rel_text
             + "".join(f"  {label}：{(v or '未提取')}\n" for label, v in rows)
             + long_text
             + text_link)
 
     html_parts.append('<p style="color:#999;font-size:12px;margin-top:10px;">'
-                      "本邮件由 JTY-BidRadar V0.2.1 自动发送 · 完整正文已存入本地数据库</p>")
+                      "本邮件由 JTY-BidRadar V0.4 自动发送 · 完整正文已存入本地数据库</p>")
     text_parts.append("─" * 40)
-    text_parts.append("本邮件由 JTY-BidRadar V0.2.1 自动发送 · 完整正文已存入本地数据库\n")
+    text_parts.append("本邮件由 JTY-BidRadar V0.4 自动发送 · 完整正文已存入本地数据库\n")
     return subject, "\n".join(html_parts), "\n".join(text_parts)
 
 

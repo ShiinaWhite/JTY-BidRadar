@@ -15,7 +15,9 @@ Source 1（中煤招标与采购网）
    ├─ HTML 列表解析 + SQLite article_id 去重
    ├─ 深基线初始化 + 历史公告保护 + 单轮新增熔断
    ├─ 详情字段提取（项目编号/招标人/代理机构/截止时间/资格要求等）
-   └─ 新公告合并为一封通知邮件（SMTP 失败自动补发）
+   ├─ 关键词相关性筛选（source1-rule-v1）：A 高相关 / B 可能相关 → 邮件通知，
+   │  C 明显不相关 → 仍完整入库（filtered）但不发邮件，可审计可回溯
+   └─ 相关公告合并为一封通知邮件，主题带 A/B 等级（SMTP 失败自动补发）
 
 Source 2（国家电网电子商务平台 电工交易专区）
 └─ 采购公告（可配置关键词，默认「山西」）
@@ -30,7 +32,8 @@ Source 2（国家电网电子商务平台 电工交易专区）
 
 ```text
 JTY-BidRadar/
-├─ monitor.py           # Source 1 主程序（监控 + 通知状态机）
+├─ monitor.py           # Source 1 主程序（监控 + 通知状态机 + 筛选调度）
+├─ source1_filter.py    # Source 1 关键词相关性筛选（纯函数，可独立测试）
 ├─ sgcc_monitor.py      # Source 2 主程序
 ├─ sgcc_client.py       # SGCC 公开 JSON API 客户端
 ├─ sgcc_extractor.py    # 公告文件递归提取（ZIP/DOCX/DOC/XLSX）
@@ -142,6 +145,7 @@ python -I tests/run_tests_v02.py      # Source 1：通知状态机 pending/sent
 python -I tests/run_tests_fix.py      # Source 1：深基线/历史保护/熔断回归
 python -I tests/run_tests_email.py    # 邮件渲染
 python -I tests/run_tests_sgcc.py     # Source 2：API 校验/软拦截/递归提取
+python -I tests/run_tests_filter.py   # Source 1：相关性筛选规则/状态机/迁移
 ```
 
 全部测试基于**合成 fixture**（`tests/fixtures/` 由 `tests/build_fixtures.py`

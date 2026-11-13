@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""JTY-BidRadar V0.2.1 配置。
+"""JTY-BidRadar V0.4 配置。
 
-技术依据：站点只读可行性调查与一次误报事故复盘（泛化说明见 docs/design-notes.md）。
-覆盖：中煤招标与采购网 → 招标公告 → 工程（ywgg1gc）+ QQ 邮件通知 + Windows 调度。
+技术依据：站点只读可行性调查、一次误报事故复盘与关键词筛选规则设计
+（泛化说明见 docs/design-notes.md）。
+覆盖：中煤招标与采购网 → 招标公告 → 工程（ywgg1gc）+ 关键词相关性筛选
+     + QQ 邮件通知 + Windows 调度。
 注意：授权码绝不写入本文件；只存在本机私密文件 data/email_secrets.json。
 """
 from pathlib import Path
@@ -22,7 +24,7 @@ SECRETS_PATH = str(PROJECT_ROOT / "data" / "email_secrets.json")  # 私密文件
 # UA 采用“普通浏览器 + 程序标识”，明确表明身份，不伪造指纹。
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 JTY-BidRadar/0.2.1"
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 JTY-BidRadar/0.4"
 )
 TIMEOUT = 18            # 连接/读取超时（秒），调查建议 15~20s
 MAX_RETRIES = 1         # 失败后额外重试次数（共尝试 2 次）

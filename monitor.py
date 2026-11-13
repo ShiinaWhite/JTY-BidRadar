@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""JTY-BidRadar V0.2.1 —— 中煤招标与采购网「招标公告 → 工程」新增公告监控 + QQ 邮件通知。
+"""JTY-BidRadar V0.4 —— 中煤招标与采购网「招标公告 → 工程」新增公告监控
++ 关键词相关性筛选（source1-rule-v1）+ QQ 邮件通知。
 
 单轮执行（非常驻；由 Windows 任务计划程序每 30 分钟调用）::
 
@@ -10,16 +11,21 @@
      → 历史保护（publish_date < 上次成功运行日期 → 静默补帐 baseline）
      → 同日/之后的未知才作为 NEW 候选 →（按需回溯分页，上限 5 页）
      → 熔断检查（NEW > MAX_NEW_PER_RUN 则跳过本轮并告警）
-     → 抓详情 → 事务入库(pending) → QQ SMTP 汇总邮件 → 标记 sent。
+     → 抓详情 → 规则分类(source1_filter) → 事务入库
+     ├─ A/B 相关 → pending → QQ SMTP 汇总邮件 → 标记 sent
+     └─ C 不相关 → filtered（仍完整入库，不发邮件）
 
-设计要点（来自可行性调查、V0.1 迭代与一次真实误报事故复盘，泛化说明见 docs/design-notes.md）：
+设计要点（来自可行性调查、V0.1 迭代、一次真实误报事故复盘与关键词筛选规则设计，泛化说明见 docs/design-notes.md）：
   * 公告唯一键 = article_id（详情 URL 中的数字 ID），不按 ID 大小判断新旧；
   * 越界/异常页码也返回 HTTP 200，因此一切有效性校验基于页面内容而非状态码；
   * 首次基线与回溯深度对齐：初始化即覆盖 5 页列表字段（≈50 条），不抓历史详情；
   * 历史保护：未知但明显早于上次成功运行日期的公告 = 历史欠账，静默补库不通知；
   * 先抓详情、解析成功后才事务入库；详情失败不入库，下一轮自动重试；
+  * 相关性筛选只决定「是否发邮件」，绝不决定「是否抓取/是否保存」——
+    C 类公告仍完整入库（notification_status='filtered'），可事后审计调规则；
   * 通知状态机：baseline（历史基线，永不通知）/ pending（已入库待通知）/
-    sent（已成功发送）——SMTP 失败不丢公告，下轮自动恢复通知。
+    sent（已成功发送）/ filtered（真新公告但低相关，抑制通知）——
+    SMTP 失败不丢公告，下轮自动恢复通知。
 
 依赖：requests、lxml（其余为标准库）。
 """
@@ -37,10 +43,11 @@ from lxml import html as lxml_html
 
 import config
 import email_notifier
+import source1_filter
 
 log = logging.getLogger("bidradar")
 
-VERSION = "V0.2.1"
+VERSION = "V0.4"
 
 # ---------------------------------------------------------------- 时间 ----
 # 统一北京时间（UTC+8，无夏令时），显式写入 +08:00，不依赖机器时区。
@@ -360,10 +367,17 @@ CREATE TABLE IF NOT EXISTS announcements (
     first_seen_at       TEXT NOT NULL,      -- 北京时间 YYYY-MM-DD HH:MM:SS+08:00
     last_checked_at     TEXT NOT NULL,
     -- V0.2 通知状态机：baseline=历史基线(永不通知) / pending=已入库待通知 / sent=已发送
+    --       V0.4 新增 filtered=真新公告但规则判低相关(不发邮件，仍完整保存)
     notification_status      TEXT NOT NULL DEFAULT 'baseline',
     notified_at              TEXT,
     notification_attempts    INTEGER NOT NULL DEFAULT 0,
-    last_notification_error  TEXT
+    last_notification_error  TEXT,
+    -- V0.4 相关性筛选审计字段（source1-rule-v1）
+    relevance_level          TEXT,               -- A 高相关 / B 可能相关 / C 明显不相关
+    relevance_score          INTEGER,            -- 规则得分
+    filter_reasons           TEXT,               -- 人类可读命中原因（如：标题命中:110kV,变电站）
+    filter_version           TEXT,               -- 规则版本（source1-rule-v1）
+    filtered_at              TEXT                -- C 类被抑制通知的时间
 );
 CREATE INDEX IF NOT EXISTS idx_ann_project_base_no ON announcements(project_base_no);
 """
@@ -374,18 +388,22 @@ _DB_FIELDS = ("article_id", "title", "publish_date", "detail_url", "project_no",
               "qualification_raw", "project_manager_raw", "performance_raw",
               "content_text", "status", "first_seen_at", "last_checked_at",
               "notification_status", "notified_at", "notification_attempts",
-              "last_notification_error")
+              "last_notification_error",
+              "relevance_level", "relevance_score", "filter_reasons",
+              "filter_version", "filtered_at")
 
 _PENDING_QUERY_FIELDS = (
     "article_id", "title", "publish_date", "detail_url", "project_no", "tenderer",
     "agency", "document_start_time", "document_end_time", "bid_deadline",
     "opening_time", "joint_venture", "qualification_raw", "project_manager_raw",
-    "performance_raw", "first_seen_at")
+    "performance_raw", "first_seen_at",
+    "relevance_level", "relevance_score", "filter_reasons")
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """幂等 schema 迁移：V0.1 库补齐 V0.2 通知列，历史数据标记为 baseline。
+    """幂等 schema 迁移：V0.1 库补齐 V0.2 通知列，V0.4 补齐筛选审计列。
 
+    旧数据不回填筛选字段（历史公告保持原通知状态，不重新解释 sent/baseline）。
     可重复执行（先查 PRAGMA 再 ALTER），绝不删库、绝不重建、不清数据。
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(announcements)")}
@@ -401,8 +419,19 @@ def migrate(conn: sqlite3.Connection) -> None:
         if cols and "last_notification_error" not in cols:
             conn.execute("ALTER TABLE announcements ADD COLUMN "
                          "last_notification_error TEXT")
+        # V0.4 相关性筛选审计列（幂等追加，历史数据留空 = 未分类）
+        if cols and "relevance_level" not in cols:
+            conn.execute("ALTER TABLE announcements ADD COLUMN relevance_level TEXT")
+        if cols and "relevance_score" not in cols:
+            conn.execute("ALTER TABLE announcements ADD COLUMN relevance_score INTEGER")
+        if cols and "filter_reasons" not in cols:
+            conn.execute("ALTER TABLE announcements ADD COLUMN filter_reasons TEXT")
+        if cols and "filter_version" not in cols:
+            conn.execute("ALTER TABLE announcements ADD COLUMN filter_version TEXT")
+        if cols and "filtered_at" not in cols:
+            conn.execute("ALTER TABLE announcements ADD COLUMN filtered_at TEXT")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-        _meta_set(conn, "schema_version", "2")
+        _meta_set(conn, "schema_version", "3")
         # 补建通知状态索引（必须在 ALTER 补列之后，V0.1 旧库直接建索引会失败）
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ann_notification "
                      "ON announcements(notification_status)")
@@ -434,8 +463,10 @@ def insert_announcement(conn: sqlite3.Connection, rec: dict,
                         notification_status: str = "pending") -> bool:
     """事务写入公告（详情解析成功/列表补帐时调用）。
 
-    notification_status: 新公告='pending'（待发邮件）；
+    notification_status: 新公告相关 A/B='pending'（待发邮件）；
+                         新公告低相关 C='filtered'（不发邮件，仍完整保存）；
                          历史欠账/首次基线='baseline'（永不通知）。
+    C 类调用方须先在 rec 中写入 filtered_at 及 relevance_* 审计字段。
     返回是否真正插入（已存在则 OR IGNORE 跳过，返回 False）。
     """
     rec = {**rec, "status": "complete",
@@ -671,6 +702,7 @@ def run_round() -> int:
         log.info("new announcements: %d (historical backfilled: %d)",
                  len(new_items), backfilled)
         if not new_items:
+            log.info("本轮筛选统计: new=0 A=0 B=0 C_filtered=0 email_candidates=0")
             send_pending_notifications(conn)   # 无新公告也要尝试补发历史 pending
             return 0
 
@@ -682,6 +714,7 @@ def run_round() -> int:
                 f"> MAX_NEW_PER_RUN={config.MAX_NEW_PER_RUN}")
 
         saved = 0
+        lvl = {"A": 0, "B": 0, "C": 0}
         for it in new_items:
             try:
                 rec = fetch_and_parse_detail(it)
@@ -690,11 +723,29 @@ def run_round() -> int:
                 log.warning("detail failed, will retry next round: id=%s (%s) err=%s",
                             it["article_id"], it["title"][:40], exc)
                 continue
-            insert_announcement(conn, rec, notification_status="pending")
+            # 相关性分类（纯函数；只决定通知与否，公告无论如何都完整入库）
+            res = source1_filter.classify_announcement(rec)
+            rec["relevance_level"] = res.level
+            rec["relevance_score"] = res.score
+            rec["filter_reasons"] = res.reasons_text
+            rec["filter_version"] = source1_filter.FILTER_VERSION
+            if res.level == source1_filter.LEVEL_C:
+                rec["filtered_at"] = now_bjt()
+                insert_announcement(conn, rec, notification_status="filtered")
+                lvl["C"] += 1
+                log.info("FILTERED [%s] level=C score=%d reasons=%s",
+                         rec["article_id"], res.score, res.reasons_text)
+            else:
+                insert_announcement(conn, rec, notification_status="pending")
+                lvl[res.level] += 1
+                log.info("FILTER [%s] level=%s score=%d reasons=%s",
+                         rec["article_id"], res.level, res.score, res.reasons_text)
             saved += 1
             _print_new(rec)
         log.info("本轮完成：新增入库 %d/%d 条（另补帐历史 %d 条）",
                  saved, len(new_items), backfilled)
+        log.info("本轮筛选统计: new=%d A=%d B=%d C_filtered=%d email_candidates=%d",
+                 saved, lvl["A"], lvl["B"], lvl["C"], lvl["A"] + lvl["B"])
         send_pending_notifications(conn)
         return saved
     finally:
