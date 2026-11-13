@@ -55,6 +55,11 @@ pip install -r requirements.txt
 依赖：`requests`、`lxml`（Source 1）；`python-docx`、`olefile`、`openpyxl`
 （Source 2 附件解析）。邮件功能全部使用 Python 标准库。
 
+**可选增强**——老式 Word 97-2003 `.doc` 原生正文提取：`Windows + Microsoft Word +
+pywin32`（`pip install pywin32`）。没有这项能力时 SGCC 主程序照常运行，只是此类
+嵌入附件标记为「部分成功」并保留原始文件；有 Word 时自动以安全模式（禁用宏、只读、
+不保存、退出无残留）提取正文。RAR 嵌入同理可选（unrar + rarfile）。
+
 ## 配置 SMTP（只需做一次）
 
 以 QQ 邮箱为例：

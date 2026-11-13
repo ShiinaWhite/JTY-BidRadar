@@ -5,6 +5,7 @@
 
     python sgcc_monitor.py               # 执行一轮检查
     python sgcc_monitor.py --test-email  # 发送测试邮件（不改任何公告状态）
+    python sgcc_monitor.py --reparse-notice <noticeId>  # 本地重解析（无网络/不发邮件）
 
 流程：noteList(SEARCH_KEY 默认山西, 第1页100条) → 内容有效性校验（软拦截防护）→ 与 SQLite 已有
      noticeId 对比 → 发现新公告 →（首页全未知时回溯分页，上限 5 页）→ getNoticeBid
@@ -28,6 +29,7 @@
 """
 import json
 import logging
+import shutil
 import sqlite3
 import sys
 import time
@@ -337,14 +339,23 @@ def process_attachment(conn: sqlite3.Connection, notice_id: str) -> tuple[str, s
 
 # ---------------------------------------------------------------- 邮件 ----
 def _parse_status_label(status: str, warning: str | None) -> str:
+    """邮件中的解析状态短文案。详细诊断只进日志与 DB parse_warning，绝不进邮件。"""
     if status == "parse_ok":
         return "成功"
     if status == "parse_partial":
-        short = (warning or "").split(";")[0].strip()
-        return f"部分成功（{short or '部分附件未解析'}）"
+        return "部分成功"
     if status == "parse_failed":
-        return "失败（公告文件未解析，已保存原始信息）"
+        return "失败"
     return "未下载"
+
+
+def _parse_status_note(status: str) -> str:
+    """解析状态的固定简短说明行（不携带任何内部路径/错误细节）。"""
+    if status == "parse_partial":
+        return "部分嵌入文档未能解析，原始公告文件已保存"
+    if status == "parse_failed":
+        return "原始公告信息已保存"
+    return ""
 
 
 def _fmt(v) -> str:
@@ -392,13 +403,17 @@ def build_sgcc_digest(items: list[dict], checked_at: str) -> tuple[str, str, str
         ]
         parse_label = _parse_status_label(it.get("parse_status", ""),
                                           it.get("parse_warning"))
+        parse_note = _parse_status_note(it.get("parse_status", ""))
         cells = "".join(
             f'<tr><td style="color:#666;padding:2px 14px 2px 0;'
             f'vertical-align:top;white-space:nowrap;">{label}</td>'
             f'<td style="padding:2px 0;">{_fmt(v)}</td></tr>'
             for label, v in rows)
         parse_html = (f'<tr><td style="color:#666;padding:2px 14px 2px 0;">公告文件解析</td>'
-                      f'<td style="padding:2px 0;">{_html_escape(parse_label)}</td></tr>')
+                      f'<td style="padding:2px 0;">{_html_escape(parse_label)}'
+                      + (f'<span style="color:#888;font-size:12px;">'
+                         f'（{_html_escape(parse_note)}）</span>' if parse_note else "")
+                      + '</td></tr>')
         html_parts.append(
             f'<div style="margin:0 0 18px;">'
             f'<h3 style="margin:10px 0 6px;font-size:15px;">【{i}】{link_html}</h3>'
@@ -408,12 +423,13 @@ def build_sgcc_digest(items: list[dict], checked_at: str) -> tuple[str, str, str
             f"{'─' * 40}\n【{i}】{it.get('title') or '未提取'}\n"
             + "".join(f"  {label}：{(v or '未提取')}\n" for label, v in rows)
             + f"  公告文件解析：{parse_label}\n"
+            + (f"  （{parse_note}）\n" if parse_note else "")
             + f"  详情：{url or '未提取'}\n")
 
     html_parts.append('<p style="color:#999;font-size:12px;margin-top:10px;">'
-                      "本邮件由 JTY-BidRadar V0.3 自动发送 · 完整文本已存入本地 SQLite 与 fulltext.txt</p>")
+                      "本邮件由 JTY-BidRadar V0.3 自动发送 · 公告原始文件与已提取文本已保存至本地</p>")
     text_parts.append("─" * 40)
-    text_parts.append("本邮件由 JTY-BidRadar V0.3 自动发送 · 完整文本已存入本地 SQLite 与 fulltext.txt\n")
+    text_parts.append("本邮件由 JTY-BidRadar V0.3 自动发送 · 公告原始文件与已提取文本已保存至本地\n")
     return subject, "\n".join(html_parts), "\n".join(text_parts)
 
 
@@ -623,11 +639,108 @@ def _run_test_email() -> int:
     return 1
 
 
+# ------------------------------------------------- 本地重解析（维护命令） ----
+def _run_reparse_notice(notice_id: str) -> int:
+    """--reparse-notice <noticeId>：只用本地 original.zip 重新解析，绝不请求网络。
+
+    行为：备份现有产物 → 清空重生成 extracted/ 与 fulltext.txt → 重建 sgcc_files
+    → 更新 parse_status/parse_warning/attachment_version/时间戳。
+    不改变 notification_status、不发送邮件（已 sent 的公告保持 sent，绝不重发）。
+    """
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT notice_id, download_path, notification_status FROM sgcc_notices "
+            "WHERE notice_id=?", (notice_id,)).fetchone()
+        if row is None:
+            log.error("reparse: notice_id 不存在: %s", notice_id)
+            return 1
+        zip_path = Path(row[1]) if row[1] else SGCC_DATA_DIR / notice_id / "original.zip"
+        if not zip_path.exists():
+            log.error("reparse: original.zip 不存在: %s", zip_path)
+            return 1
+        notice_dir = zip_path.parent
+        ts = now_bjt().replace(":", "").replace(" ", "_").replace("+0800", "")
+
+        # 1) 备份现有产物（fulltext / extracted）
+        backup_dir = notice_dir / f"backup_{ts}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backed_up = []
+        for item in ("fulltext.txt", "extracted"):
+            src = notice_dir / item
+            if src.exists():
+                dest = backup_dir / item
+                if src.is_dir():
+                    shutil.copytree(src, dest)
+                else:
+                    shutil.copy2(src, dest)
+                backed_up.append(item)
+        if backed_up:
+            log.info("reparse: 已备份 %s -> %s", ", ".join(backed_up), backup_dir)
+
+        # 2) 清空 extracted 后重新递归提取（避免旧文件残留混淆）
+        old_extracted = notice_dir / "extracted"
+        if old_extracted.exists():
+            shutil.rmtree(old_extracted, ignore_errors=True)
+        result = sgcc_extractor.extract_notice_zip(zip_path, notice_dir)
+        warning = "; ".join(result.warnings) if result.warnings else None
+        if not result.files:
+            status = "parse_failed"
+            warning = warning or "ZIP 无可解析条目"
+        elif result.warnings:
+            status = "parse_partial"
+        else:
+            status = "parse_ok"
+
+        # 3) 重建 fulltext.txt（与 process_attachment 相同格式）
+        r = conn.execute(
+            "SELECT title, project_code, buyer, agency, publish_time, purchase_type, "
+            "openbid_time FROM sgcc_notices WHERE notice_id=?", (notice_id,)).fetchone()
+        basics = ([f"项目名称: {r[0] or '未提取'}", f"采购编号: {r[1] or '未提取'}",
+                   f"采购人: {r[2] or '未提取'}", f"代理机构: {r[3] or '未提取'}",
+                   f"发布时间: {r[4] or '未提取'}", f"采购类型: {r[5] or '未提取'}",
+                   f"开启应答时间: {r[6] or '未提取'}"] if r
+                  else [f"notice_id: {notice_id}"])
+        fulltext = sgcc_extractor.build_fulltext(basics, result)
+        fulltext_path = notice_dir / "fulltext.txt"
+        fulltext_path.write_text(fulltext, encoding="utf-8")
+
+        # 4) 更新 DB（绝不触碰 notification_status）
+        with conn:
+            conn.execute(
+                "UPDATE sgcc_notices SET parse_status=?, parse_warning=?, fulltext_path=?, "
+                "download_path=?, attachment_version=attachment_version+1, "
+                "last_attachment_check_at=?, last_checked_at=? WHERE notice_id=?",
+                (status, warning, str(fulltext_path), str(zip_path), ts, now_bjt(),
+                 notice_id))
+            conn.execute("DELETE FROM sgcc_files WHERE notice_id=?", (notice_id,))
+            conn.executemany(
+                "INSERT INTO sgcc_files (notice_id, relative_path, filename, file_type, "
+                "size, sha256, depth, parent_file, extracted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                [(notice_id, f.relative_path, f.filename, f.file_type, f.size, f.sha256,
+                  f.depth, f.parent_file, now_bjt()) for f in result.files])
+        log.info("reparse 完成: notice=%s status=%s files=%d warnings=%d "
+                 "(notification_status 保持 %s 不变)",
+                 notice_id, status, len(result.files), len(result.warnings), row[2])
+        return 0
+    except Exception:
+        log.exception("reparse 未预期错误: notice=%s", notice_id)
+        return 2
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
     setup_logging()
     if "--test-email" in args:
         return _run_test_email()
+    if "--reparse-notice" in args:
+        i = args.index("--reparse-notice")
+        if i + 1 >= len(args):
+            log.error("用法: python sgcc_monitor.py --reparse-notice <noticeId>")
+            return 1
+        return _run_reparse_notice(args[i + 1].strip())
     log.info("JTY-BidRadar %s [SGCC] started", VERSION)
     t0 = time.monotonic()
     try:

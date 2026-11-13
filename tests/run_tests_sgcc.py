@@ -546,10 +546,16 @@ def t_s11b_four_level():
     ok("S11b 嵌套 XLSX（depth=1）", sum(1 for f in res.files
                                         if f.depth == 1
                                         and f.file_type == "XLSX") >= 2)
-    # 深层 oleObject1.bin 是叶子 .doc（正文仅在 WordDocument 流，纯 Python 不可提取），
-    # 按设计必须告警（不静默），整条公告仍为部分成功
-    assert_eq("S11b 恰有 1 条叶子 .doc 告警", len(res.warnings), 1)
-    ok("S11b 告警内容正确", "DOC 无嵌入对象" in res.warnings[0], str(res.warnings))
+    # 深层 oleObject1.bin 是叶子 .doc（正文仅在 WordDocument 流）：
+    # 有 Word COM 条件 → 正文被兜底提取（0 告警）；无条件 → 恰 1 条告警不静默
+    import sgcc_word_fallback
+    if sgcc_word_fallback.is_available():
+        assert_eq("S11b 深层原生doc经COM提取（无告警）", len(res.warnings), 0)
+        ok("S11b COM 正文进入 section",
+           any("Word COM 提取成功" in s for s in res.sections))
+    else:
+        assert_eq("S11b 无COM时恰 1 条叶子 .doc 告警", len(res.warnings), 1)
+        ok("S11b 告警内容正确", "DOC 无嵌入对象" in res.warnings[0], str(res.warnings))
 
 
 def t_s12_xlsx():

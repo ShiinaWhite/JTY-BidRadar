@@ -345,7 +345,8 @@ class _Walker:
             elif kind == "XLSX" and openpyxl:
                 section.append(xlsx_text(payload, ""))
             elif kind == "DOC" and olefile:
-                self._handle_doc(payload, name, out_dir, depth, source, section)
+                self._handle_doc(payload, name, out_dir, depth, source, section,
+                                 disk_path=disk)
             elif kind == "RAR":
                 self._handle_rar(payload, name, out_dir, depth, source, section)
             else:
@@ -355,9 +356,18 @@ class _Walker:
             section.append(f"[解析失败：{type(exc).__name__}]")
         self.result.sections.append("\n".join(section))
 
-    # -- 老式 DOC（OLE ObjectPool） --
+    # -- 老式 DOC / OLE 嵌入容器 --
     def _handle_doc(self, payload: bytes, name: str, out_dir: Path,
-                    depth: int, source: str, section: list[str]) -> None:
+                    depth: int, source: str, section: list[str],
+                    disk_path: Path | None = None) -> None:
+        """处理 OLE 复合文档。已知两种嵌入形态，纯 Python 优先：
+          a) Word 风格：ObjectPool/_XXXXX/{package, \\x01Ole10Native}（常见主流）；
+          b) 打包对象：OLE 根级 {package, \\x01Ole10Native}（生产实测形态，
+             docx 直接嵌入"打包文件对象"，package 流即原始文件字节）。
+        两种形态统一按"流名"识别，不要求必须位于 ObjectPool 之下。
+        仅当流名 package/Ole10Native 一条都没有、且存在 WordDocument 流
+        （真·原生 Word 97-2003 .doc）时，才窄触发可选的 Word COM 正文兜底。
+        """
         try:
             ole = olefile.OleFileIO(io.BytesIO(payload))
         except Exception as exc:
@@ -366,19 +376,25 @@ class _Walker:
                            "正式版可用 Word COM 兜底（本轮未启用）]")
             return
         found = False
+        has_word_document = False
         try:
+            has_word_document = ole.exists("WordDocument")
             for st in ole.listdir():
                 sp = "/".join(st)
                 sttype = ole.get_type(st)
-                if sttype != olefile.STGTY_STREAM or "objectpool" not in sp.lower():
+                if sttype != olefile.STGTY_STREAM:
+                    continue
+                low = sp.lower()
+                if not (low.endswith("package") or "ole10native" in low):
                     continue
                 found = True
                 blob = ole.openstream(st).read()
-                low = sp.lower()
                 if low.endswith("package"):
                     kind = sniff(blob)
                     section.append(f"[OLE 嵌入 package] {sp} ({len(blob)}B, {kind})")
-                    self._handle(safe_name(sp.split("/")[-2] + "_" + sp.split("/")[-1]),
+                    # ObjectPool/_X/package 取父目录名拼前缀；根级 package 用容器名
+                    prefix = sp.split("/")[-2] if "/" in sp else name
+                    self._handle(safe_name(prefix + "_" + sp.split("/")[-1]),
                                  blob, out_dir, depth + 1, parent_file=name,
                                  source=f"{source}!{sp}")
                 elif "ole10native" in low:
@@ -395,10 +411,46 @@ class _Walker:
                                      source=f"{source}!{fname or sp}")
         finally:
             ole.close()
-        if not found:
-            section.append("[.doc 无 ObjectPool 嵌入对象——正文可能仅存于 WordDocument 流，"
-                           "纯 Python 无法可靠提取老式 .doc 正文；如遇此情况建议 Word COM 兜底]")
-            self.result.warnings.append(f"DOC 无嵌入对象且未提取正文: {source}")
+        if found:
+            return
+        # —— 纯 Python 未能提取任何嵌入内容 ——
+        if has_word_document and disk_path is not None:
+            # 真·原生 Word 97-2003 .doc：正文仅在 WordDocument 流 → 可选 Word COM 兜底
+            self._try_word_com_fallback(disk_path, source, section)
+            return
+        section.append("[.doc 无可提取的嵌入对象（package/Ole10Native 均不存在）]")
+        self.result.warnings.append(f"DOC 无嵌入对象且未提取正文: {source}")
+
+    def _try_word_com_fallback(self, disk_path: Path,
+                               source: str, section: list[str]) -> None:
+        """窄触发的可选兜底：原生 .doc（有 WordDocument 流）正文提取。
+
+        使用 extractor 已安全落盘的文件（sgcc_word_fallback 内部再复制为
+        *.doc 临时副本交给 Word）；任何失败都降级为 WARNING，不中断。
+        """
+        try:
+            import sgcc_word_fallback
+        except ImportError:
+            self.result.warnings.append(f"Word COM 模块缺失，原生 .doc 正文未提取: {source}")
+            section.append("[原生 .doc 正文需要 sgcc_word_fallback 模块（未安装）]")
+            return
+        if not sgcc_word_fallback.is_available():
+            warn = (f"原生 .doc 正文未提取（本机无 Microsoft Word/pywin32）: {source}")
+            self.result.warnings.append(warn)
+            section.append("[原生 .doc 正文未能解析——本机无 Word COM 条件，原始文件已保存]")
+            log.info(warn)
+            return
+        section.append("[原生 .doc 正文——Word COM 安全兜底提取]")
+        r = sgcc_word_fallback.extract_doc_text_with_word(disk_path)
+        if r.success:
+            section.append(f"[Word COM 提取成功，正文 {len(r.text)} 字符]")
+            section.append(r.text)
+            log.info("word fallback extracted %d chars from %s", len(r.text), source)
+        else:
+            warn = f"原生 .doc 正文未提取（{r.warning or '未知原因'}）: {source}"
+            self.result.warnings.append(warn)
+            section.append("[原生 .doc 正文未能解析——原始文件已保存]")
+            log.warning(warn)
 
     # -- RAR（可选能力） --
     def _handle_rar(self, payload: bytes, name: str, out_dir: Path,
