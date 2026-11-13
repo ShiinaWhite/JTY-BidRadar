@@ -449,8 +449,11 @@ def _truncate_field(text: str | None, limit: int = STRUCT_FIELD_LIMIT) -> str:
 def _structured_blocks(it: dict) -> list[tuple[str, str]]:
     """从公告记录组装结构化条件展示块（参考 Source 1 邮件体验）。
 
-    优先级（任务书九）：project_manager_raw → "项目负责人要求"；
-    否则 personnel_raw → "人员要求"；两者都有 → 各自展示；都没有 → 一行
+    阅读优先级：项目内容 → 负责人/人员 → 业绩 → 最高限价 → 工期 →
+    资格要求最后（资格要求常达 1000~3000 字，放最后便于手机端先判断
+    "干什么/要什么人/什么业绩/多少钱/干多久"）。
+    人员规则：project_manager_raw → "项目负责人要求"；personnel_raw →
+    "人员要求"；两者都有 → 各自展示；都没有 → 一行
     "未单独提取，请查看公告文件"（不编造）。全部字段为空 → 提示查看官方公告。
     """
     scope = _truncate_field(it.get("project_scope_raw"))
@@ -464,8 +467,6 @@ def _structured_blocks(it: dict) -> list[tuple[str, str]]:
     blocks: list[tuple[str, str]] = []
     if scope:
         blocks.append(("项目内容", scope))
-    if qual:
-        blocks.append(("投标/应答人资格要求", qual))
     if manager:
         blocks.append(("项目负责人要求", manager))
     if personnel:
@@ -478,6 +479,8 @@ def _structured_blocks(it: dict) -> list[tuple[str, str]]:
         blocks.append(("最高限价", price))
     if duration:
         blocks.append(("工期 / 服务期", duration))
+    if qual:
+        blocks.append(("投标/应答人资格要求", qual))
     # 有意义条件（内容/资格/业绩/限价/工期）全空 → 提示查看官方公告（任务书十四）
     if not any((scope, qual, performance, price, duration)):
         blocks.append(("关键采购条件",

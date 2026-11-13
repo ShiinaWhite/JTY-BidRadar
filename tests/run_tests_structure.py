@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""JTY-BidRadar SGCC 结构化提取与邮件展示测试（Q1~Q8）。
+"""JTY-BidRadar SGCC 结构化提取与邮件展示测试（Q1~Q7、Q9）。
 
 Q1 单包 Excel 表头提取
 Q2 多包条件不串包
@@ -8,7 +8,8 @@ Q4 项目经理缺失 → 人员要求展示
 Q5 无资格信息 → 不编造
 Q6 超长资格要求 → 3000 字截断
 Q7 结构化失败 → 邮件仍正常发送（附件链路不受影响）
-Q8 真实生产样本回归：仅 private 环境执行（public 使用 Q1~Q7 合成夹具）
+Q8 真实生产样本回归：仅 private 环境执行（public 使用 Q1~Q7、Q9 合成夹具）
+Q9 邮件展示顺序 → 资格要求最后（阅读优先级回归保护）
 
 用法：python -I tests/run_tests_structure.py
 """
@@ -220,6 +221,51 @@ def t_q7_structure_failure_email_still_sent():
 
 
 
+def t_q9_mail_block_order():
+    """Q9 邮件展示顺序（阅读优先级回归保护）：
+
+    项目内容 < 负责人/人员 < 业绩要求 < 最高限价 < 工期 / 服务期 <
+    投标/应答人资格要求（最后）。HTML 与纯文本都必须满足，防止重构时顺序倒回。
+    """
+    item = {
+        "title": "邮件展示顺序测试项目公告", "project_code": "TEST-001",
+        "publish_time": "2026-11-13 10:00", "purchase_type": "竞争性谈判",
+        "buyer": "测试采购人单位", "agency": "测试代理机构",
+        "bidbook_end_time": "2026-11-20 17:00",
+        "openbid_time": "2026-11-25 09:00", "openbid_address": "测试市",
+        "detail_url": "http://x/y", "parse_status": "parse_ok",
+        "parse_warning": None, "first_seen_at": "-",
+        "project_scope_raw": "测试项目内容：配电终端成套设备供货与服务",
+        "qualification_raw": "通用资格要求：" + "长" * 1800,
+        "project_manager_raw": None, "personnel_raw": None,
+        "performance_raw": "自2021年1月1日以来具有2个同类业绩",
+        "price_ceiling_raw": "220.24（万元）",
+        "duration_raw": "2026年12月30日-2027年12月31日",
+    }
+    subject, html, text = sgcc_monitor.build_sgcc_digest([item], "now")
+    others = ("项目内容", "项目负责人 / 人员要求", "业绩要求",
+              "最高限价", "工期 / 服务期")
+    for doc_name, doc in (("HTML", html), ("纯文本", text)):
+        ok(f"Q9 {doc_name} 项目内容 在 业绩要求 之前",
+           0 <= doc.find("项目内容") < doc.find("业绩要求"))
+        ok(f"Q9 {doc_name} 业绩要求 在 最高限价 之前",
+           0 <= doc.find("业绩要求") < doc.find("最高限价"))
+        ok(f"Q9 {doc_name} 最高限价 在 工期 / 服务期 之前",
+           0 <= doc.find("最高限价") < doc.find("工期 / 服务期"))
+        qual_pos = doc.find("投标/应答人资格要求")
+        ok(f"Q9 {doc_name} 资格要求存在", qual_pos > 0)
+        for other in others:
+            ok(f"Q9 {doc_name} 『{other}』在资格要求之前",
+               0 <= doc.find(other) < qual_pos)
+    # 人员规则回归：manager 有值 → 『项目负责人要求』块位于业绩要求之前
+    item2 = dict(item, project_manager_raw="须持二级建造师证书")
+    _, html2, text2 = sgcc_monitor.build_sgcc_digest([item2], "now")
+    for doc_name, doc in (("HTML", html2), ("纯文本", text2)):
+        ok(f"Q9 {doc_name} 项目负责人要求 在 业绩要求 之前",
+           0 <= doc.find("项目负责人要求") < doc.find("业绩要求"))
+        ok(f"Q9 {doc_name} 不出现兜底人员提示", "未单独提取，请查看公告文件" not in doc)
+
+
 def main() -> int:
     print("== JTY-BidRadar SGCC 结构化提取测试 ==")
     t_q1_single_package()
@@ -229,6 +275,7 @@ def main() -> int:
     t_q5_no_qualification()
     t_q6_long_field()
     t_q7_structure_failure_email_still_sent()
+    t_q9_mail_block_order()
     print(f"\n全部通过：{_passed} 项断言")
     return 0
 
