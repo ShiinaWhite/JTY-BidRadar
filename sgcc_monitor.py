@@ -6,6 +6,7 @@
     python sgcc_monitor.py               # 执行一轮检查
     python sgcc_monitor.py --test-email  # 发送测试邮件（不改任何公告状态）
     python sgcc_monitor.py --reparse-notice <noticeId>  # 本地重解析（无网络/不发邮件）
+    python sgcc_monitor.py --resend-preview <noticeId>  # 按当前模板重发一封预览邮件（无网络/不改状态）
 
 流程：noteList(SEARCH_KEY 默认山西, 第1页100条) → 内容有效性校验（软拦截防护）→ 与 SQLite 已有
      noticeId 对比 → 发现新公告 →（首页全未知时回溯分页，上限 5 页）→ getNoticeBid
@@ -129,7 +130,24 @@ _NOTIFIED_FIELDS = (
     "publish_time", "publish_org", "purchase_type", "buyer", "agency",
     "bidbook_end_time", "openbid_time", "openbid_address", "detail_url",
     "parse_status", "parse_warning", "first_seen_at",
+    # 结构化关键采购条件（sgcc-structure-v1）
+    "project_scope_raw", "qualification_raw", "project_manager_raw",
+    "personnel_raw", "performance_raw", "price_ceiling_raw", "duration_raw",
+    "structured_extract_status",
 )
+
+# 结构化提取字段 → 幂等迁移列定义（sgcc-structure-v1）
+_STRUCTURE_COLUMNS = {
+    "project_scope_raw": "TEXT",
+    "qualification_raw": "TEXT",
+    "project_manager_raw": "TEXT",
+    "personnel_raw": "TEXT",
+    "performance_raw": "TEXT",
+    "price_ceiling_raw": "TEXT",
+    "duration_raw": "TEXT",
+    "structured_extract_status": "TEXT NOT NULL DEFAULT 'not_attempted'",
+    "structured_extract_version": "TEXT",
+}
 
 _INSERT_FIELDS = (
     "notice_id", "doctype", "project_code", "purprj_id", "title", "project_name",
@@ -147,7 +165,17 @@ def open_db() -> sqlite3.Connection:
     Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(config.DB_PATH)
     conn.executescript(_SCHEMA)   # 幂等：只建 SGCC 自己的表，不触碰中煤表
+    _migrate_sgcc(conn)           # 幂等：sgcc_notices 补结构化字段列
     return conn
+
+
+def _migrate_sgcc(conn: sqlite3.Connection) -> None:
+    """幂等 schema 迁移：为 sgcc_notices 补结构化提取列（绝不删数据）。"""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(sgcc_notices)")}
+    with conn:
+        for name, decl in _STRUCTURE_COLUMNS.items():
+            if cols and name not in cols:
+                conn.execute(f"ALTER TABLE sgcc_notices ADD COLUMN {name} {decl}")
 
 
 def _meta_get(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
@@ -332,9 +360,50 @@ def process_attachment(conn: sqlite3.Connection, notice_id: str) -> tuple[str, s
             "size, sha256, depth, parent_file, extracted_at) VALUES (?,?,?,?,?,?,?,?,?)",
             [(notice_id, f.relative_path, f.filename, f.file_type, f.size, f.sha256,
               f.depth, f.parent_file, ts) for f in result.files])
+    _store_structured_fields(conn, notice_id, fulltext)
     log.info("sgcc attachment parsed: notice=%s status=%s files=%d warnings=%d",
              notice_id, status, len(result.files), len(result.warnings))
     return status, warning or ""
+
+
+# ------------------------------------------------- 结构化提取（sgcc-structure-v1） ----
+def _store_structured_fields(conn: sqlite3.Connection, notice_id: str,
+                             fulltext: str) -> str:
+    """fulltext → 结构化关键字段 → sgcc_notices 幂等列。
+
+    结构化失败绝不影响公告通知链路：任何异常都记 failed 并返回，公告照常入库/发信。
+    返回 structured_extract_status。
+    """
+    import sgcc_structure
+    try:
+        r = sgcc_structure.extract_structured_fields(fulltext)
+        f = r["fields"]
+        status = r["status"]
+        with conn:
+            conn.execute(
+                "UPDATE sgcc_notices SET project_scope_raw=?, qualification_raw=?, "
+                "project_manager_raw=?, personnel_raw=?, performance_raw=?, "
+                "price_ceiling_raw=?, duration_raw=?, structured_extract_status=?, "
+                "structured_extract_version=? WHERE notice_id=?",
+                (f.get("project_scope_raw"), f.get("qualification_raw"),
+                 f.get("project_manager_raw"), f.get("personnel_raw"),
+                 f.get("performance_raw"), f.get("price_ceiling_raw"),
+                 f.get("duration_raw"), status, r.get("version"), notice_id))
+        log.info("sgcc structured extract: notice=%s status=%s packages=%s",
+                 notice_id, status, r.get("packages"))
+        return status
+    except Exception:  # noqa: BLE001 防御：结构化器异常不得中断通知
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE sgcc_notices SET structured_extract_status='failed', "
+                    "structured_extract_version=? WHERE notice_id=?",
+                    (sgcc_structure.STRUCTURE_VERSION, notice_id))
+        except Exception:
+            pass
+        log.exception("sgcc structured extract failed (notification unaffected): "
+                      "notice=%s", notice_id)
+        return "failed"
 
 
 # ---------------------------------------------------------------- 邮件 ----
@@ -362,6 +431,58 @@ def _fmt(v) -> str:
     """邮件字段格式化（None/空 → 未提取，HTML 转义）。"""
     v = (v or "").strip() if isinstance(v, str) else v
     return _html_escape(str(v)) if v else "未提取"
+
+
+# 结构化字段邮件展示：单字段上限 3000 字，超出截断（不提数据库）
+STRUCT_FIELD_LIMIT = 3000
+
+
+def _truncate_field(text: str | None, limit: int = STRUCT_FIELD_LIMIT) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"……（内容过长，邮件仅展示前 {limit} 字）"
+
+
+def _structured_blocks(it: dict) -> list[tuple[str, str]]:
+    """从公告记录组装结构化条件展示块（参考 Source 1 邮件体验）。
+
+    优先级（任务书九）：project_manager_raw → "项目负责人要求"；
+    否则 personnel_raw → "人员要求"；两者都有 → 各自展示；都没有 → 一行
+    "未单独提取，请查看公告文件"（不编造）。全部字段为空 → 提示查看官方公告。
+    """
+    scope = _truncate_field(it.get("project_scope_raw"))
+    qual = _truncate_field(it.get("qualification_raw"))
+    manager = _truncate_field(it.get("project_manager_raw"))
+    personnel = _truncate_field(it.get("personnel_raw"))
+    performance = _truncate_field(it.get("performance_raw"))
+    price = _truncate_field(it.get("price_ceiling_raw"))
+    duration = _truncate_field(it.get("duration_raw"))
+
+    blocks: list[tuple[str, str]] = []
+    if scope:
+        blocks.append(("项目内容", scope))
+    if qual:
+        blocks.append(("投标/应答人资格要求", qual))
+    if manager:
+        blocks.append(("项目负责人要求", manager))
+    if personnel:
+        blocks.append(("人员要求", personnel))
+    if not manager and not personnel:
+        blocks.append(("项目负责人 / 人员要求", "未单独提取，请查看公告文件"))
+    if performance:
+        blocks.append(("业绩要求", performance))
+    if price:
+        blocks.append(("最高限价", price))
+    if duration:
+        blocks.append(("工期 / 服务期", duration))
+    # 有意义条件（内容/资格/业绩/限价/工期）全空 → 提示查看官方公告（任务书十四）
+    if not any((scope, qual, performance, price, duration)):
+        blocks.append(("关键采购条件",
+                       "关键条件未能自动结构化，请点击官方公告查看"))
+    return blocks
 
 
 def build_sgcc_digest(items: list[dict], checked_at: str) -> tuple[str, str, str]:
@@ -414,16 +535,29 @@ def build_sgcc_digest(items: list[dict], checked_at: str) -> tuple[str, str, str
                       + (f'<span style="color:#888;font-size:12px;">'
                          f'（{_html_escape(parse_note)}）</span>' if parse_note else "")
                       + '</td></tr>')
+        # 结构化关键采购条件（sgcc-structure-v1）：基础信息后逐块展示
+        structured_html = ""
+        structured_text = ""
+        for label, content in _structured_blocks(it):
+            content_esc = _html_escape(content).replace("\n", "<br>")
+            structured_html += (
+                f'<div style="margin:8px 0 0;">'
+                f'<div style="color:#1e52a8;font-size:13px;font-weight:bold;'
+                f'margin:0 0 2px;">{label}</div>'
+                f'<div style="color:#444;font-size:13px;line-height:1.7;'
+                f'white-space:pre-line;">{content_esc}</div></div>')
+            structured_text += f"\n【{label}】\n{content}\n"
         html_parts.append(
             f'<div style="margin:0 0 18px;">'
             f'<h3 style="margin:10px 0 6px;font-size:15px;">【{i}】{link_html}</h3>'
             f'<table style="font-size:14px;line-height:1.7;border-collapse:collapse;">'
-            f'{cells}{parse_html}</table></div>')
+            f'{cells}{parse_html}</table>{structured_html}</div>')
         text_parts.append(
             f"{'─' * 40}\n【{i}】{it.get('title') or '未提取'}\n"
             + "".join(f"  {label}：{(v or '未提取')}\n" for label, v in rows)
             + f"  公告文件解析：{parse_label}\n"
             + (f"  （{parse_note}）\n" if parse_note else "")
+            + structured_text
             + f"  详情：{url or '未提取'}\n")
 
     html_parts.append('<p style="color:#999;font-size:12px;margin-top:10px;">'
@@ -704,6 +838,7 @@ def _run_reparse_notice(notice_id: str) -> int:
         fulltext = sgcc_extractor.build_fulltext(basics, result)
         fulltext_path = notice_dir / "fulltext.txt"
         fulltext_path.write_text(fulltext, encoding="utf-8")
+        _store_structured_fields(conn, notice_id, fulltext)
 
         # 4) 更新 DB（绝不触碰 notification_status）
         with conn:
@@ -730,6 +865,47 @@ def _run_reparse_notice(notice_id: str) -> int:
         conn.close()
 
 
+# ------------------------------------------------- 人工预览重发（维护命令） ----
+def _run_resend_preview(notice_id: str) -> int:
+    """--resend-preview <noticeId>：用当前邮件模板把一条公告重发一封预览邮件。
+
+    仅供人工维护（模板修改后手机端检查展示效果）。语义：
+      仅使用本地数据库 → 不访问网络、不重新解析、不重新下载；
+      不修改任何公告状态（notification_status/notified_at/attempts/
+      first_seen_at 原样保留）；主题自动加 [重发预览] 标记与正式邮件区分。
+    """
+    conn = open_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                f"SELECT {', '.join(_NOTIFIED_FIELDS)} FROM sgcc_notices "
+                f"WHERE notice_id=?", (notice_id,)).fetchone()
+        finally:
+            conn.row_factory = None
+        if row is None:
+            log.error("resend-preview: notice_id 不存在: %s", notice_id)
+            return 1
+        notice = dict(row)
+        cfg = email_notifier.load_config()
+        if not cfg:
+            log.error("resend-preview: 邮箱未配置（python setup_email.py）")
+            return 1
+        subject, html, text = build_sgcc_digest([notice], now_bjt())
+        subject = subject.replace("[JTY-BidRadar][SGCC]",
+                                  "[JTY-BidRadar][SGCC][重发预览]", 1)
+        ok, err = email_notifier.send_email(cfg, subject, html, text)
+        if ok:
+            log.info("resend-preview: 预览邮件已发送 -> %s（notice=%s，"
+                     "公告状态未改动）", cfg["to_addr"], notice_id)
+            return 0
+        log.error("resend-preview: 发送失败: %s",
+                  type(err).__name__ if err else "Unknown")
+        return 1
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
     setup_logging()
@@ -741,6 +917,12 @@ def main(argv: list[str] | None = None) -> int:
             log.error("用法: python sgcc_monitor.py --reparse-notice <noticeId>")
             return 1
         return _run_reparse_notice(args[i + 1].strip())
+    if "--resend-preview" in args:
+        i = args.index("--resend-preview")
+        if i + 1 >= len(args):
+            log.error("用法: python sgcc_monitor.py --resend-preview <noticeId>")
+            return 1
+        return _run_resend_preview(args[i + 1].strip())
     log.info("JTY-BidRadar %s [SGCC] started", VERSION)
     t0 = time.monotonic()
     try:
